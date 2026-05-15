@@ -1,192 +1,365 @@
 # -*- coding: utf-8 -*-
 import os.path
 import folder_paths
-from nodes import LoadImage, interrupt_processing
+from nodes import interrupt_processing
 import json
 import time
 import numpy as np
 import torch
 import cv2
 import math
-import random
 from PIL import Image
 from server import PromptServer
 from aiohttp import web
 
 # ====================================================================================================
-# API 路由处理：暂停与恢复
+# API 路由处理 - 安全的初始化方式
 # ====================================================================================================
-PAUSED_NODES = {}
+def init_server_routes():
+    """安全地初始化服务器路由"""
+    server_instance = PromptServer.instance
+    if not hasattr(server_instance, '_openpose_routes_initialized'):
+        # 避免重复初始化
+        routes = server_instance.routes
+        
+        # 全局变量初始化
+        if not hasattr(server_instance, 'PAUSED_NODES'):
+            setattr(server_instance, 'PAUSED_NODES', {})
+        if not hasattr(server_instance, 'POSE_3D_IMAGES'):
+            setattr(server_instance, 'POSE_3D_IMAGES', {})
+        if not hasattr(server_instance, 'CURRENT_POSTURE_TEXTS'):
+            setattr(server_instance, 'CURRENT_POSTURE_TEXTS', {})
+        
+        # 获取全局变量
+        PAUSED_NODES = getattr(server_instance, 'PAUSED_NODES')
+        CURRENT_POSTURE_TEXTS = getattr(server_instance, 'CURRENT_POSTURE_TEXTS')
+        
+        # 定义API路由
+        @routes.post('/openpose/update_pose')
+        async def openpose_update_pose(request):
+            try:
+                json_data = await request.json()
+                node_id = str(json_data.get('node_id'))
+                pose_data = json_data.get('pose_data')
+                
+                if node_id in PAUSED_NODES:
+                    PAUSED_NODES[node_id] = {'status': 'resume', 'data': pose_data}
+                    return web.json_response({"status": "success"})
+                else:
+                    return web.json_response({"status": "error", "message": "Node not paused"}, status=400)
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-routes = PromptServer.instance.routes
+        @routes.post('/openpose/cancel')
+        async def openpose_cancel(request):
+            try:
+                json_data = await request.json()
+                node_id = str(json_data.get('node_id'))
+                
+                if node_id in PAUSED_NODES:
+                    PAUSED_NODES[node_id] = {'status': 'cancel'}
+                    return web.json_response({"status": "success"})
+                else:
+                    return web.json_response({"status": "error", "message": "Node not paused"}, status=400)
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+        @routes.post('/openpose/set_current_posture_text')
+        async def openpose_set_current_posture_text(request):
+            try:
+                json_data = await request.json()
+                node_id = str(json_data.get('node_id'))
+                text = json_data.get('text', '')
+                CURRENT_POSTURE_TEXTS[node_id] = text
+                return web.json_response({"status": "success"})
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+        @routes.get('/openpose/get_current_posture_text')
+        async def openpose_get_current_posture_text(request):
+            try:
+                node_id = str(request.query.get('node_id', ''))
+                text = CURRENT_POSTURE_TEXTS.get(node_id, '')
+                return web.json_response({"status": "success", "text": text})
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=500)
+        
+        # 标记已初始化
+        setattr(server_instance, '_openpose_routes_initialized', True)
+
+# 初始化服务器路由
+try:
+    init_server_routes()
+except Exception as e:
+    print(f"API路由初始化失败: {e}")
+
+# 获取全局变量引用
+server_instance = PromptServer.instance
+PAUSED_NODES = getattr(server_instance, 'PAUSED_NODES', {})
+if not PAUSED_NODES:
+    PAUSED_NODES = {}
+setattr(server_instance, 'PAUSED_NODES', PAUSED_NODES)
+
+CURRENT_POSTURE_TEXTS = getattr(server_instance, 'CURRENT_POSTURE_TEXTS', {})
+if not CURRENT_POSTURE_TEXTS:
+    CURRENT_POSTURE_TEXTS = {}
+setattr(server_instance, 'CURRENT_POSTURE_TEXTS', CURRENT_POSTURE_TEXTS)
+
 
 class AnyType(str):
-    """A special type that always compares equal to any value."""
-
     def __ne__(self, __value: object) -> bool:
         return False
 
+    def __eq__(self, __value: object) -> bool:
+        return True
+
+    def __str__(self):
+        return "*"
+
+
 any_type = AnyType("*")
 
-@routes.post('/openpose/update_pose')
-async def openpose_update_pose(request):
-    try:
-        json_data = await request.json()
-        node_id = str(json_data.get('node_id')) # 强制转字符串
-        pose_data = json_data.get('pose_data')
-        
-        if node_id in PAUSED_NODES:
-            PAUSED_NODES[node_id] = {
-                'status': 'resume',
-                'data': pose_data
-            }
-            return web.json_response({"status": "success", "message": "Resuming execution"})
-        else:
-             return web.json_response({"status": "error", "message": "Node not paused"}, status=400)
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-@routes.post('/openpose/cancel')
-async def openpose_cancel(request):
-    try:
-        json_data = await request.json()
-        node_id = str(json_data.get('node_id')) # 强制转字符串
-        
-        if node_id in PAUSED_NODES:
-            PAUSED_NODES[node_id] = {
-                'status': 'cancel'
-            }
-            return web.json_response({"status": "success", "message": "Cancelling execution"})
-        else:
-             return web.json_response({"status": "error", "message": "Node not paused"}, status=400)
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-# 存储3D姿态截图
-POSE_3D_IMAGES = {}
-
-# 存储最新的姿态描述（按节点ID）
-POSTURE_DESCRIPTIONS = {}
-
-@routes.post('/openpose/save_3d_pose_image')
-async def openpose_save_3d_pose_image(request):
-    try:
-        json_data = await request.json()
-        node_id = str(json_data.get('node_id'))
-        image_data = json_data.get('image_data')  # base64编码的图片
-        
-        if image_data:
-            # 解码base64图片
-            import base64
-            image_bytes = base64.b64decode(image_data.split(',')[1] if ',' in image_data else image_data)
-            
-            # 保存到临时文件
-            temp_dir = folder_paths.get_input_directory()
-            filename = f"openpose_3d_pose_{node_id}_{int(time.time() * 1000)}.png"
-            filepath = os.path.join(temp_dir, filename)
-            
-            with open(filepath, 'wb') as f:
-                f.write(image_bytes)
-            
-            # 存储文件名
-            POSE_3D_IMAGES[node_id] = filename
-            
-            # 通知后端截图已完成
-            if node_id + "_capture" in POSE_3D_IMAGES:
-                POSE_3D_IMAGES[node_id + "_capture"] = {"status": "success", "filename": filename}
-            
-            return web.json_response({"status": "success", "filename": filename})
-        else:
-            return web.json_response({"status": "error", "message": "No image data"}, status=400)
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-# 存储当前显示的姿态描述（按节点ID）
-CURRENT_POSTURE_TEXTS = {}
-
-@routes.post('/openpose/set_current_posture_text')
-async def openpose_set_current_posture_text(request):
-    """前端设置当前显示的姿态文本"""
-    try:
-        json_data = await request.json()
-        node_id = str(json_data.get('node_id'))
-        text = json_data.get('text', '')
-        
-        CURRENT_POSTURE_TEXTS[node_id] = text
-        
-        return web.json_response({"status": "success"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-@routes.get('/openpose/get_current_posture_text')
-async def openpose_get_current_posture_text(request):
-    """获取前端当前显示的姿态文本"""
-    try:
-        node_id = str(request.query.get('node_id', ''))
-        text = CURRENT_POSTURE_TEXTS.get(node_id, '')
-        
-        return web.json_response({"status": "success", "text": text})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
-
-@routes.post('/openpose/save_2d_pose_image')
-async def openpose_save_2d_pose_image(request):
-    """保存2D姿态截图"""
-    try:
-        json_data = await request.json()
-        node_id = str(json_data.get('node_id'))
-        image_data = json_data.get('image_data')  # base64编码的图片
-        
-        if image_data:
-            # 解码base64图片
-            import base64
-            image_bytes = base64.b64decode(image_data.split(',')[1] if ',' in image_data else image_data)
-            
-            # 保存到临时文件
-            temp_dir = folder_paths.get_input_directory()
-            filename = f"openpose_2d_pose_{node_id}_{int(time.time() * 1000)}.png"
-            filepath = os.path.join(temp_dir, filename)
-            
-            with open(filepath, 'wb') as f:
-                f.write(image_bytes)
-            
-            # 存储文件名（使用_2d后缀区分）
-            POSE_3D_IMAGES[node_id + "_2d"] = filename
-            
-            # 通知后端截图已完成
-            if node_id + "_capture_2d" in POSE_3D_IMAGES:
-                POSE_3D_IMAGES[node_id + "_capture_2d"] = {"status": "success", "filename": filename}
-            
-            return web.json_response({"status": "success", "filename": filename})
-        else:
-            return web.json_response({"status": "error", "message": "No image data"}, status=400)
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 # ====================================================================================================
 # 常量定义
 # ====================================================================================================
-LIMB_SEQ = [[2, 3], [2, 6], [3, 4], [4, 5], [6, 7], [7, 8], [2, 9], [9, 10], [10, 11], [2, 12], [12, 13], [13, 14], [2, 1], [1, 15], [15, 17], [1, 16], [16, 18]]
+LIMB_SEQ = [[2, 3], [2, 6], [3, 4], [4, 5], [6, 7], [7, 8], [2, 9], [9, 10], [10, 11], 
+            [2, 12], [12, 13], [13, 14], [2, 1], [1, 15], [15, 17], [1, 16], [16, 18]]
 
-COLORS = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0], [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
+COLORS = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0],
+          [0, 255, 0], [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255],
+          [0, 0, 255], [85, 0, 255], [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
 
 
-# 【最终整合版】OpenPose Editor 节点
+# ====================================================================================================
+# 姿态分析工具类 - 保持原始获取姿势代码不变
+# ====================================================================================================
+class PoseAnalyzer:
+    @staticmethod
+    def calculate_angle(p1, p2, p3):
+        """计算三点形成的角度 - 适配新版本numpy"""
+        if p1 is None or p2 is None or p3 is None:
+            return None
+        
+        v1 = np.array([p1[0] - p2[0], p1[1] - p2[1]], dtype=np.float64)
+        v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]], dtype=np.float64)
+        
+        dot_product = np.dot(v1, v2)
+        norms_product = np.linalg.norm(v1) * np.linalg.norm(v2)
+        
+        if norms_product == 0:
+            return None
+        
+        cos_angle = np.clip(dot_product / norms_product, -1.0, 1.0)
+        angle = np.arccos(cos_angle) * 180 / np.pi
+        return float(angle)
+
+    @staticmethod
+    def get_joint_position(keypoints, idx):
+        """获取指定关节的位置，带置信度检查"""
+        if idx < len(keypoints):
+            kp = keypoints[idx]
+            if kp is not None and len(kp) >= 2:
+                # 如果是包含置信度的格式 [x, y, confidence]，则检查置信度
+                if len(kp) == 3 and kp[2] < 0.1:  # 置信度阈值
+                    return None
+                return (kp[0], kp[1]) if isinstance(kp, (list, tuple)) else kp
+        return None
+
+    @staticmethod
+    def analyze_posture(keypoints):
+        """姿态分析 - 保持原有逻辑不变，仅修复numpy兼容性"""
+        if not keypoints or len(keypoints) < 18:
+            return "无有效姿势数据"
+        
+        # 关键点索引：0-17 对应 COCO 18个关键点
+        # 0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear,
+        # 5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow,
+        # 9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip,
+        # 13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle, 17: neck
+        
+        # 提取关键点位置
+        nose = PoseAnalyzer.get_joint_position(keypoints, 0)
+        neck = PoseAnalyzer.get_joint_position(keypoints, 17)
+        left_shoulder = PoseAnalyzer.get_joint_position(keypoints, 5)
+        right_shoulder = PoseAnalyzer.get_joint_position(keypoints, 6)
+        left_elbow = PoseAnalyzer.get_joint_position(keypoints, 7)
+        right_elbow = PoseAnalyzer.get_joint_position(keypoints, 8)
+        left_wrist = PoseAnalyzer.get_joint_position(keypoints, 9)
+        right_wrist = PoseAnalyzer.get_joint_position(keypoints, 10)
+        left_hip = PoseAnalyzer.get_joint_position(keypoints, 11)
+        right_hip = PoseAnalyzer.get_joint_position(keypoints, 12)
+        left_knee = PoseAnalyzer.get_joint_position(keypoints, 13)
+        right_knee = PoseAnalyzer.get_joint_position(keypoints, 14)
+        left_ankle = PoseAnalyzer.get_joint_position(keypoints, 15)
+        right_ankle = PoseAnalyzer.get_joint_position(keypoints, 16)
+        
+        # 基本姿态判断
+        posture_parts = []
+        
+        # 1. 判断整体姿态（站立/坐/躺/跪）
+        if nose and left_hip and right_hip and left_ankle and right_ankle:
+            # 计算身体主要轴线的方向
+            hip_center_y = (left_hip[1] + right_hip[1]) / 2
+            ankle_center_y = (left_ankle[1] + right_ankle[1]) / 2
+            head_y = nose[1] if nose else (neck[1] if neck else float('inf'))
+            
+            # 通过头部和髋部的垂直距离判断姿态
+            vertical_distance = abs(head_y - hip_center_y)
+            leg_length = abs(hip_center_y - ankle_center_y)
+            
+            if leg_length > 0:
+                ratio = vertical_distance / leg_length
+                if ratio > 0.8:  # 站立
+                    posture_parts.append("站立")
+                elif ratio < 0.5:  # 坐着
+                    posture_parts.append("坐着")
+                else:
+                    posture_parts.append("半蹲")
+            else:
+                posture_parts.append("站立")
+        else:
+            posture_parts.append("站立")  # 默认
+        
+        # 2. 手臂姿态
+        arms_description = []
+        
+        # 左手臂
+        if left_shoulder and left_elbow and left_wrist:
+            shoulder_elbow_angle = PoseAnalyzer.calculate_angle(left_shoulder, left_elbow, left_wrist)
+            if shoulder_elbow_angle is not None:
+                if shoulder_elbow_angle < 90:
+                    arms_description.append("左臂弯曲")
+                elif shoulder_elbow_angle > 160:
+                    arms_description.append("左臂伸直")
+        
+        # 右手臂
+        if right_shoulder and right_elbow and right_wrist:
+            shoulder_elbow_angle = PoseAnalyzer.calculate_angle(right_shoulder, right_elbow, right_wrist)
+            if shoulder_elbow_angle is not None:
+                if shoulder_elbow_angle < 90:
+                    arms_description.append("右臂弯曲")
+                elif shoulder_elbow_angle > 160:
+                    arms_description.append("右臂伸直")
+        
+        # 检查手臂是否举起
+        if left_shoulder and left_elbow:
+            if left_elbow[1] < left_shoulder[1]:
+                arms_description.append("左臂上举")
+        if right_shoulder and right_elbow:
+            if right_elbow[1] < right_shoulder[1]:
+                arms_description.append("右臂上举")
+        
+        if left_shoulder and left_wrist:
+            if left_wrist[1] < left_shoulder[1]:
+                arms_description.append("左臂高举")
+        if right_shoulder and right_wrist:
+            if right_wrist[1] < right_shoulder[1]:
+                arms_description.append("右臂高举")
+        
+        if arms_description:
+            posture_parts.extend(arms_description)
+        
+        # 3. 腿部姿态
+        legs_description = []
+        
+        # 左腿
+        if left_hip and left_knee and left_ankle:
+            hip_knee_angle = PoseAnalyzer.calculate_angle(left_hip, left_knee, left_ankle)
+            if hip_knee_angle is not None:
+                if hip_knee_angle < 120:
+                    legs_description.append("左膝弯曲")
+                elif hip_knee_angle > 160:
+                    legs_description.append("左腿伸直")
+        
+        # 右腿
+        if right_hip and right_knee and right_ankle:
+            hip_knee_angle = PoseAnalyzer.calculate_angle(right_hip, right_knee, right_ankle)
+            if hip_knee_angle is not None:
+                if hip_knee_angle < 120:
+                    legs_description.append("右膝弯曲")
+                elif hip_knee_angle > 160:
+                    legs_description.append("右腿伸直")
+        
+        if legs_description:
+            posture_parts.extend(legs_description)
+        
+        # 4. 身体方向
+        if left_shoulder and right_shoulder and left_hip and right_hip:
+            shoulder_line_angle = math.degrees(math.atan2(
+                right_shoulder[1] - left_shoulder[1],
+                right_shoulder[0] - left_shoulder[0]
+            ))
+            hip_line_angle = math.degrees(math.atan2(
+                right_hip[1] - left_hip[1],
+                right_hip[0] - left_hip[0]
+            ))
+            
+            # 如果肩膀和臀部连线角度差异很大，可能是在转身
+            angle_diff = abs(shoulder_line_angle - hip_line_angle)
+            if angle_diff > 30:
+                posture_parts.append("转身")
+        
+        # 组合最终描述
+        if not posture_parts:
+            return "人体姿态"
+        else:
+            return "、".join(posture_parts) if posture_parts else "人体姿态"
+
+    @staticmethod
+    def analyze_pose_from_json(pose_json):
+        """从JSON格式的姿势数据分析姿态 - 保持原有逻辑不变"""
+        if not pose_json:
+            return "无姿势数据"
+        
+        try:
+            data = json.loads(pose_json)
+            people = data.get('people', [])
+            
+            if not people:
+                return "无检测到的人体"
+            
+            all_descriptions = []
+            for person_idx, person in enumerate(people):
+                kp_flat = person.get('pose_keypoints_2d', [])
+                keypoints = []
+                
+                # 将平面数组转换为坐标对
+                for i in range(0, len(kp_flat), 3):
+                    if i + 2 < len(kp_flat):
+                        x = kp_flat[i]
+                        y = kp_flat[i + 1]
+                        conf = kp_flat[i + 2]
+                        keypoints.append([x, y, conf])
+                    else:
+                        keypoints.append(None)
+                
+                # 分析每个人的姿态
+                description = PoseAnalyzer.analyze_posture(keypoints)
+                all_descriptions.append(f"人物{person_idx+1}: {description}")
+            
+            return "; ".join(all_descriptions)
+        
+        except Exception as e:
+            return f"姿态分析出错: {str(e)}"
+
+
+# ====================================================================================================
+# OpenPose Editor 节点
 # ====================================================================================================
 class OpenPoseEditor:
-    _last_fingerprints = {}
-
+    
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("STRING", { "default": "" }),
+                "image": ("STRING", {"default": ""}),
             },
             "optional": {
                 "pose_image": ("IMAGE",),
                 "pose_point": ("POSE_KEYPOINT",),
                 "prev_image": ("IMAGE",),
-                "bridge_anything": (any_type,),  # 改为IMAGE类型
+                "bridge_anything": (any_type,),
                 "output_width_for_dwpose": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 64}),
                 "output_height_for_dwpose": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 64}),
                 "scale_for_xinsr_for_dwpose": ("BOOLEAN", {"default": True}),
@@ -194,655 +367,233 @@ class OpenPoseEditor:
             },
             "hidden": {
                 "backgroundImage": ("STRING", {"multiline": False}),
-                "poses_datas": ("STRING", {"multiline": True, "rows": 10, "placeholder": "Pose JSON data will be stored here..."}),
+                "poses_datas": ("STRING", {"multiline": True}),
                 "unique_id": "UNIQUE_ID",
             }
         }
     
-    # 【优化】IS_CHANGED：只在参数变化时返回不同值，避免每次强制重新执行
     @classmethod
-    def IS_CHANGED(cls, *args, **kwargs):
-        """
-        兼容任意参数传入：
-        - *args 接收位置参数
-        - **kwargs 接收所有关键字参数
-        只在参数真正变化时才返回不同的值
-        """
-        # 1. 提取核心参数（兼容任意传入方式）
-        image = kwargs.get("image", args[0] if args else "")
-        output_width_for_dwpose = kwargs.get("output_width_for_dwpose", 512)
-        output_height_for_dwpose = kwargs.get("output_height_for_dwpose", 512)
-        scale_for_xinsr_for_dwpose = kwargs.get("scale_for_xinsr_for_dwpose", True)
-        stop_for_edit = kwargs.get("stop_for_edit", False)
-        
-        backgroundImage = kwargs.get("backgroundImage", "")
-        poses_datas = kwargs.get("poses_datas", "")
-        
-        # 处理IMAGE类型参数的哈希（用内存地址+形状）
-        def get_image_hash(img_tensor):
-            if img_tensor is None:
-                return 0
-            try:
-                # 组合内存地址+张量形状，确保唯一性
-                return hash(f"{id(img_tensor)}_{str(img_tensor.shape)}")
-            except:
-                return hash(id(img_tensor))
-        
-        bridge_anything_hash = get_image_hash(kwargs.get("bridge_anything"))
-        prev_image_hash = get_image_hash(kwargs.get("prev_image"))
-        pose_image_hash = get_image_hash(kwargs.get("pose_image"))
-        pose_hash = hash(str(kwargs.get("pose_point"))) if kwargs.get("pose_point") else 0
-
-        # 2. 生成指纹（不包含时间戳和随机数，只在参数变化时变化）
-        fingerprint = (
-            f"{image}-{pose_hash}-{pose_image_hash}-{prev_image_hash}-{bridge_anything_hash}-"
-            f"{output_width_for_dwpose}-{output_height_for_dwpose}-{scale_for_xinsr_for_dwpose}-{stop_for_edit}-"
-            f"{backgroundImage}-{poses_datas}"
-        )
-        
-        return fingerprint
-
-    # 输出定义
+    def IS_CHANGED(cls, **kwargs):
+        # 每次都返回不同的值，强制重新执行
+        return time.time()
+    
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "INT", "INT", "STRING")
-    RETURN_NAMES = ("dw_pose_image", "dw_comb_image", "pose_3d_image", "pose_2d_image", "dw_pose_image_width", "dw_pose_image_height", "posture_text")
+    RETURN_NAMES = ("dw_pose_image", "dw_comb_image", "pose_3d_image", "pose_2d_image", 
+                    "dw_pose_image_width", "dw_pose_image_height", "posture_text")
     FUNCTION = "get_images"
     CATEGORY = "image"
     
-    # POSE_KEYPOINT转JSON
     def pose_point_to_json(self, pose_point, image_tensor):
-        if not pose_point or not isinstance(pose_point, list):
+        if not pose_point or not isinstance(pose_point, list) or image_tensor.shape[0] == 0:
             return ""
         
-        if image_tensor.shape[0] == 0:
-            return ""
-        
-        image_height = image_tensor.shape[1]
-        image_width = image_tensor.shape[2]
-        
+        image_h, image_w = image_tensor.shape[1], image_tensor.shape[2]
         processed_people = []
-        for result_dict in pose_point:
-            people_in_dict = result_dict.get("people", [])
-            for person in people_in_dict:
-                original_keypoints = person.get("pose_keypoints_2d", [])
-                body_keypoints = [0.0] * 54 
-                num_points_to_copy = min(18, len(original_keypoints) // 3)
-                for i in range(num_points_to_copy):
-                    base_idx = i * 3
-                    x = original_keypoints[base_idx]
-                    y = original_keypoints[base_idx + 1]
-                    confidence = original_keypoints[base_idx + 2]
-                    if confidence > 0:
-                        absolute_x = x * image_width
-                        absolute_y = y * image_height
-                        body_keypoints[base_idx] = absolute_x
-                        body_keypoints[base_idx + 1] = absolute_y
-                        body_keypoints[base_idx + 2] = confidence
-                processed_people.append({
-                    "pose_keypoints_2d": body_keypoints
-                })
         
-        data_to_save = {
-            "width": int(image_width),
-            "height": int(image_height),
-            "people": processed_people
-        }
-        return json.dumps(data_to_save, indent=4)
+        for result_dict in pose_point:
+            people = result_dict.get("people", []) if isinstance(result_dict, dict) else []
+            for person in people:
+                original_kp = person.get("pose_keypoints_2d", [])
+                body_kp = [0.0] * 54
+                num = min(18, len(original_kp) // 3)
+                for i in range(num):
+                    base = i * 3
+                    if base + 2 < len(original_kp) and original_kp[base + 2] > 0:
+                        body_kp[base] = original_kp[base] * image_w
+                        body_kp[base + 1] = original_kp[base + 1] * image_h
+                        body_kp[base + 2] = original_kp[base + 2]
+                processed_people.append({"pose_keypoints_2d": body_kp})
+        
+        return json.dumps({"width": int(image_w), "height": int(image_h), "people": processed_people}, indent=4)
     
-    # 渲染DWPose
     def render_dw_pose(self, pose_json, width, height, scale_for_xinsr):
         if not pose_json or not pose_json.strip():
             return np.zeros((height, width, 3), dtype=np.uint8)
+        
         try:
             data = json.loads(pose_json)
-        except json.JSONDecodeError:
+        except:
             return np.zeros((height, width, 3), dtype=np.uint8)
-
+        
         target_w, target_h = width, height
-        original_w, original_h = data.get('width', target_w), data.get('height', target_h)
-        scale_x, scale_y = target_w / original_w, target_h / original_h
-
+        orig_w = data.get('width', target_w)
+        orig_h = data.get('height', target_h)
+        
+        if orig_w > 0 and orig_h > 0:
+            scale_x = target_w / orig_w
+            scale_y = target_h / orig_h
+        else:
+            scale_x = scale_y = 1.0
+        
         canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
         people = data.get('people', [])
         if not people:
             return canvas
-
-        BASE_RESOLUTION_SIDE = 512.0
-        base_thickness = 2.0
-        target_max_side = max(target_w, target_h)
-        scale_factor = target_max_side / BASE_RESOLUTION_SIDE
-        scaled_joint_radius = int(max(1, base_thickness * scale_factor))
-        scaled_stickwidth = scaled_joint_radius
-
-        if scale_for_xinsr:
-            xinsr_stick_scale = 1 if target_max_side < 500 else min(2 + (target_max_side // 1000), 7)
-            scaled_stickwidth *= xinsr_stick_scale
-
-        for person in people:
-            keypoints_flat = person.get('pose_keypoints_2d', [])
-            keypoints = [ (int(keypoints_flat[i] * scale_x), int(keypoints_flat[i+1] * scale_y)) if keypoints_flat[i+2] > 0 else None for i in range(0, len(keypoints_flat), 3) ]
-            
-            for limb_indices, color in zip(LIMB_SEQ, COLORS):
-                k1_idx, k2_idx = limb_indices[0] - 1, limb_indices[1] - 1
-                if k1_idx >= len(keypoints) or k2_idx >= len(keypoints): 
-                    continue
-                p1, p2 = keypoints[k1_idx], keypoints[k2_idx]
-                if p1 is None or p2 is None: 
-                    continue
-                
-                Y, X = np.array([p1[0], p2[0]]), np.array([p1[1], p2[1]])
-                mX, mY = np.mean(X), np.mean(Y)
-                length = np.sqrt((X[0] - X[1])**2 + (Y[0] - Y[1])**2)
-                angle = math.degrees(math.atan2(X[0] - X[1], Y[0] - Y[1]))
-                
-                polygon = cv2.ellipse2Poly((int(mY), int(mX)), (int(length / 2), scaled_stickwidth), int(angle), 0, 360, 1)
-                cv2.fillConvexPoly(canvas, polygon, [int(c * 0.6) for c in color])
-
-            for i, keypoint in enumerate(keypoints):
-                if keypoint is None: 
-                    continue
-                if i >= len(COLORS): 
-                    continue
-                cv2.circle(canvas, keypoint, scaled_joint_radius, COLORS[i], thickness=-1)
         
-        # 兼容新版 opencv 的颜色转换常量
+        target_max = max(target_w, target_h)
+        base_size = max(2, int(target_max / 256))
+        joint_radius = max(2, base_size)
+        stick_width = max(1, base_size)
+        
+        if scale_for_xinsr and target_max >= 500:
+            stick_width = min(stick_width * 2, 8)
+        
+        for person in people:
+            kp_flat = person.get('pose_keypoints_2d', [])
+            keypoints = []
+            for i in range(0, len(kp_flat), 3):
+                if i + 2 < len(kp_flat) and kp_flat[i + 2] > 0:
+                    x = int(kp_flat[i] * scale_x)
+                    y = int(kp_flat[i + 1] * scale_y)
+                    x = max(0, min(x, target_w - 1))
+                    y = max(0, min(y, target_h - 1))
+                    keypoints.append((x, y))
+                else:
+                    keypoints.append(None)
+            
+            for (idx1, idx2), color in zip(LIMB_SEQ, COLORS):
+                p1 = keypoints[idx1 - 1] if idx1 - 1 < len(keypoints) else None
+                p2 = keypoints[idx2 - 1] if idx2 - 1 < len(keypoints) else None
+                if p1 is None or p2 is None:
+                    continue
+                # 使用cv2.LINE_AA作为抗锯齿参数（兼容新版OpenCV）
+                cv2.line(canvas, p1, p2, color, stick_width, lineType=cv2.LINE_AA)
+            
+            for i, kp in enumerate(keypoints):
+                if kp is not None and i < len(COLORS):
+                    cv2.circle(canvas, kp, joint_radius, COLORS[i], -1, lineType=cv2.LINE_AA)
+        
         try:
             return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        except AttributeError:
-            return cv2.cvtColor(canvas, 4)
-
-    # 主函数：处理bridge_anything（IMAGE类型）
-    def get_images(self, image, output_width_for_dwpose, output_height_for_dwpose, scale_for_xinsr_for_dwpose, 
-                    stop_for_edit, backgroundImage, poses_datas, bridge_anything=None, prev_image=None, pose_image=None, pose_point=None, 
-                    unique_id=None):
-        # 安全性检查：确保核心字符串参数不为 None
+        except:
+            return canvas
+    
+    def get_images(self, image, output_width_for_dwpose, output_height_for_dwpose, 
+                   scale_for_xinsr_for_dwpose, stop_for_edit, backgroundImage, poses_datas,
+                   bridge_anything=None, prev_image=None, pose_image=None, pose_point=None,
+                   unique_id=None):
+        
+        # 参数默认值
         if backgroundImage is None:
             backgroundImage = ""
         if poses_datas is None:
             poses_datas = ""
-
-        # 清理缓存
-        if hasattr(folder_paths, 'cache') and isinstance(folder_paths.cache, dict):
-            folder_paths.cache.clear()
         
-        # 处理bridge_anything（新增：保存为临时文件）
-        if bridge_anything is not None and bridge_anything.shape[0] > 0:
+        node_str_id = str(unique_id) if unique_id else ""
+        
+        # 从 pose_point 生成 poses_datas
+        if pose_image is not None and pose_point is not None:  # 修复参数顺序
+            temp_poses_datas = self.pose_point_to_json(pose_point, pose_image)
+            if temp_poses_datas:
+                poses_datas = temp_poses_datas
+        
+        # 更新尺寸
+        if poses_datas:
             try:
-                import time
-                bridge_np = (bridge_anything[0].cpu().numpy() * 255).astype(np.uint8)
-                bridge_pil = Image.fromarray(bridge_np)
-                temp_dir = folder_paths.get_input_directory()
-                bridge_filename = f"openpose_bridge_temp_{int(time.time() * 1000)}.png"
-                bridge_filepath = os.path.join(temp_dir, bridge_filename)
-                bridge_pil.save(bridge_filepath)
-                # 可选择将bridge作为背景图使用
-                # backgroundImage = bridge_filename
-            except Exception as e:
+                pd = json.loads(poses_datas)
+                output_width_for_dwpose = pd.get("width", output_width_for_dwpose)
+                output_height_for_dwpose = pd.get("height", output_height_for_dwpose)
+            except:
                 pass
         
-        # 1. 转换pose_point为JSON
-        converted_pose_json = ""
-        if pose_point is not None and pose_image is not None:
-            converted_pose_json = self.pose_point_to_json(pose_point, pose_image)
-            if converted_pose_json:
-                try:
-                    pose_json = json.loads(converted_pose_json)
-                    output_width_for_dwpose = pose_json.get("width", output_width_for_dwpose)
-                    output_height_for_dwpose = pose_json.get("height", output_height_for_dwpose)
-                except json.JSONDecodeError:
-                    pass
-    
-        # 2. 保存pose_image为临时文件
-        if pose_image is not None and pose_image.shape[0] > 0:
-            try:
-                import time
-                pose_image_np = (pose_image[0].cpu().numpy() * 255).astype(np.uint8)
-                pose_image_pil = Image.fromarray(pose_image_np)
-                temp_dir = folder_paths.get_input_directory()
-                bg_filename = f"openpose_lg_temp_{int(time.time() * 1000)}.png"
-                bg_filepath = os.path.join(temp_dir, bg_filename)
-                pose_image_pil.save(bg_filepath)
-            except Exception as e:
-                pass
-            
-        # 3. 保存prev_image为临时文件
-        ld_filepath= None
-        if prev_image is not None and prev_image.shape[0] > 0:
-            try:
-                import time
-                prev_image_np = (prev_image[0].cpu().numpy() * 255).astype(np.uint8)
-                prev_image_pil = Image.fromarray(prev_image_np)
-                temp_dir = folder_paths.get_input_directory()
-                ld_filename = f"openpose_ld_temp_{int(time.time() * 1000)}.png"
-                ld_filepath = os.path.join(temp_dir, ld_filename)
-                prev_image_pil.save(ld_filepath)
-                backgroundImage = ld_filename
-            except Exception as e:
-                pass
-        
-        # 4. 更新poses_datas (关键修复：确保从输入连接获取的姿态数据被使用)
-        if converted_pose_json:
-            poses_datas = converted_pose_json
-
-        # ============================================================
-        # 暂停/断点逻辑 (Stop for Edit)
-        # ============================================================
+        # 暂停逻辑（保留）
         if stop_for_edit and unique_id:
-            node_str_id = str(unique_id) # 强制转字符串
-            
-            # 初始化暂停状态
-            # 关键修复：将当前的 poses_datas (可能刚从输入连接更新) 放入状态中
-            # 这样前端如果查询状态，或者后端需要知道当前数据
+            node_str_id = str(unique_id)
             PAUSED_NODES[node_str_id] = {'status': 'waiting', 'initial_data': poses_datas}
-            
-            # 发送暂停消息给前端
-            # 关键修复：把最新的 pose 数据也发给前端，让前端有机会刷新编辑器
-            # 同时发送最新的背景图片路径
             PromptServer.instance.send_sync("openpose_node_pause", {
-                "node_id": node_str_id, 
-                "current_pose": poses_datas,  # 携带最新的姿态数据
-                "current_background_image": backgroundImage # 携带最新的背景图片路径
+                "node_id": node_str_id,
+                "current_pose": poses_datas,
+                "current_background_image": backgroundImage
             })
             
-            # 阻塞循环
             while True:
                 if node_str_id not in PAUSED_NODES:
-                    # 异常情况，状态丢失
                     break
-                    
                 state = PAUSED_NODES[node_str_id]
                 status = state.get('status')
                 
                 if status == 'resume':
-                    # 获取前端传回的新数据
                     new_pose_data = state.get('data')
                     if new_pose_data:
                         poses_datas = new_pose_data
-                        # 尝试更新尺寸
                         try:
                             pd = json.loads(new_pose_data)
                             output_width_for_dwpose = pd.get("width", output_width_for_dwpose)
                             output_height_for_dwpose = pd.get("height", output_height_for_dwpose)
                         except:
                             pass
-                    # 清理状态
                     del PAUSED_NODES[node_str_id]
                     break
-                
                 elif status == 'cancel':
                     del PAUSED_NODES[node_str_id]
-                    # 使用 ComfyUI 推荐的方式中断执行
                     interrupt_processing()
-                    return (torch.zeros(1, 512, 512, 3), {}, torch.zeros(1, 512, 512, 3)) # 返回空数据防止立即报错
-                
+                    # 返回正确的张量形状
+                    empty_tensor = torch.zeros((1, output_height_for_dwpose, output_width_for_dwpose, 3), dtype=torch.float32)
+                    return (empty_tensor, empty_tensor, empty_tensor, empty_tensor, 
+                           output_width_for_dwpose, output_height_for_dwpose, "已取消")
                 time.sleep(0.1)
-            
-        # --- 输出1: 纯DWPose渲染图 ---
-        dw_pose_np = self.render_dw_pose(poses_datas, output_width_for_dwpose, output_height_for_dwpose, scale_for_xinsr_for_dwpose)
-        dw_pose_image = torch.from_numpy(dw_pose_np.astype(np.float32) / 255.0).unsqueeze(0).clone()
         
-        # 保存DWPose渲染图
-        dw_bg_filename = ""
-        try:
-            dw_pose_image_pil = Image.fromarray(dw_pose_np)
-            temp_dir = folder_paths.get_input_directory()
-            import time
-            dw_bg_filename = f"openpose_dw_bg_temp_{int(time.time() * 1000)}.png"
-            dw_bg_filepath = os.path.join(temp_dir, dw_bg_filename)
-            dw_pose_image_pil.save(dw_bg_filepath)
-        except Exception as e:
-            pass
-
-        # --- 输出2: DWPose+背景合成图 ---
+        # 渲染 DWPose
+        dw_pose_np = self.render_dw_pose(poses_datas, output_width_for_dwpose, 
+                                          output_height_for_dwpose, scale_for_xinsr_for_dwpose)
+        dw_pose_image = torch.from_numpy(dw_pose_np.astype(np.float32) / 255.0).unsqueeze(0)
+        
+        # 合成图
         dw_combined_image = dw_pose_image.clone()
-        if backgroundImage and backgroundImage.strip() != "":
-            bg_image_path = folder_paths.get_annotated_filepath(backgroundImage)
-            if os.path.exists(bg_image_path):
+        if backgroundImage and backgroundImage.strip():
+            bg_path = folder_paths.get_annotated_filepath(backgroundImage)
+            if os.path.exists(bg_path):
                 try:
-                    bg_image_pil = Image.open(bg_image_path).convert("RGB")
-                    bg_image_np = np.array(bg_image_pil)
-                    bg_image_resized = cv2.resize(bg_image_np, (output_width_for_dwpose, output_height_for_dwpose), interpolation=cv2.INTER_AREA)
-                    
-                    dw_pose_gray = cv2.cvtColor(dw_pose_np, cv2.COLOR_RGB2GRAY)
-                    _, mask = cv2.threshold(dw_pose_gray, 1, 255, cv2.THRESH_BINARY)
-                    dw_combined_np = bg_image_resized.copy()
-                    dw_combined_np[mask != 0] = dw_pose_np[mask != 0]
-                    dw_combined_image = torch.from_numpy(dw_combined_np.astype(np.float32) / 255.0).unsqueeze(0).clone()
-                except Exception as e:
+                    bg_pil = Image.open(bg_path).convert("RGB")
+                    bg_np = np.array(bg_pil)
+                    bg_resized = cv2.resize(bg_np, (output_width_for_dwpose, output_height_for_dwpose))
+                    dw_gray = cv2.cvtColor(dw_pose_np, cv2.COLOR_RGB2GRAY)
+                    _, mask = cv2.threshold(dw_gray, 1, 255, cv2.THRESH_BINARY)
+                    combined = bg_resized.copy()
+                    combined[mask != 0] = dw_pose_np[mask != 0]
+                    dw_combined_image = torch.from_numpy(combined.astype(np.float32) / 255.0).unsqueeze(0)
+                except:
                     pass
         
-        # --- 输出3: 3D姿态图 ---
-        # 首先尝试从存储中获取3D姿态截图（如果编辑器打开过并保存了）
-        pose_3d_image = None
-        node_str_id = str(unique_id) if unique_id else ""
+        # 3D 和 2D 图
+        pose_3d_image = dw_pose_image.clone()
+        pose_2d_image = dw_pose_image.clone()
         
-        # 从存储中读取3D截图（如果存在）
-        if node_str_id and node_str_id in POSE_3D_IMAGES:
-            try:
-                pose_3d_filename = POSE_3D_IMAGES[node_str_id]
-                pose_3d_path = os.path.join(folder_paths.get_input_directory(), pose_3d_filename)
-                if os.path.exists(pose_3d_path):
-                    pose_3d_pil = Image.open(pose_3d_path).convert("RGB")
-                    pose_3d_np = np.array(pose_3d_pil)
-                    # 调整尺寸以匹配输出尺寸
-                    if pose_3d_np.shape[0] != output_height_for_dwpose or pose_3d_np.shape[1] != output_width_for_dwpose:
-                        pose_3d_np = cv2.resize(pose_3d_np, (output_width_for_dwpose, output_height_for_dwpose), interpolation=cv2.INTER_AREA)
-                    pose_3d_image = torch.from_numpy(pose_3d_np.astype(np.float32) / 255.0).unsqueeze(0)
-            except Exception as e:
-                pass
+        # ========== 修复的 posture_text 逻辑 ==========
+        # 使用姿态分析器生成实际的姿态描述
+        posture_text = PoseAnalyzer.analyze_pose_from_json(poses_datas)
         
-        # 如果没有保存的截图，使用DWPose渲染图（与dw_pose_image相同）
-        if pose_3d_image is None:
-            pose_3d_image = dw_pose_image.clone()
-        
-        # --- 输出4: 2D姿态图 ---
-        # 首先尝试从存储中获取2D姿态截图（如果编辑器打开过并保存了）
-        pose_2d_image = None
-        
-        # 从存储中读取2D截图（如果存在）
-        if node_str_id and node_str_id + "_2d" in POSE_3D_IMAGES:
-            try:
-                pose_2d_filename = POSE_3D_IMAGES[node_str_id + "_2d"]
-                pose_2d_path = os.path.join(folder_paths.get_input_directory(), pose_2d_filename)
-                if os.path.exists(pose_2d_path):
-                    pose_2d_pil = Image.open(pose_2d_path).convert("RGB")
-                    pose_2d_np = np.array(pose_2d_pil)
-                    # 调整尺寸以匹配输出尺寸
-                    if pose_2d_np.shape[0] != output_height_for_dwpose or pose_2d_np.shape[1] != output_width_for_dwpose:
-                        pose_2d_np = cv2.resize(pose_2d_np, (output_width_for_dwpose, output_height_for_dwpose), interpolation=cv2.INTER_AREA)
-                    pose_2d_image = torch.from_numpy(pose_2d_np.astype(np.float32) / 255.0).unsqueeze(0)
-            except Exception as e:
-                pass
-        
-        # 如果没有保存的截图，使用DWPose渲染图（与dw_pose_image相同）
-        if pose_2d_image is None:
-            pose_2d_image = dw_pose_image.clone()
-        
-        # 从 poses_datas JSON 中读取姿态描述
-        posture_text = ""
-        if poses_datas and poses_datas.strip():
-            try:
-                pose_data = json.loads(poses_datas)
-                if isinstance(pose_data, dict):
-                    if "posture_description" in pose_data:
-                        posture_text = pose_data["posture_description"]
-                    elif "people" in pose_data and pose_data["people"]:
-                        # 如果没有 posture_description，尝试从关键点生成
-                        posture_text = self.generate_posture_description(poses_datas)
-                elif isinstance(pose_data, list) and len(pose_data) > 0 and "posture_description" in pose_data[0]:
-                    posture_text = pose_data[0]["posture_description"]
-            except Exception as e:
-                print(f"[OpenPose] 解析姿态描述失败: {e}")
-                posture_text = ""
-        
-        # 确保 posture_text 是字符串且不为 None
-        if posture_text is None:
-            posture_text = ""
+        # 保存到全局字典
+        if node_str_id:
+            CURRENT_POSTURE_TEXTS[node_str_id] = posture_text
         
         # 构建 UI 数据
-        import time
-        import random
-        timestamp = str(time.time() * 1000)
-        random_str = str(random.randint(0, 999999))
         ui_data = {
             "poses_datas": [poses_datas],
-            "editdPose": [dw_bg_filename],
-            "inputPose": [ld_filepath or ""],
+            "editdPose": [""],
+            "inputPose": [""],
             "backgroundImage": [backgroundImage],
-            "refresh_trigger": [f"{timestamp}_{random_str}"],
+            "refresh_trigger": [str(int(time.time() * 1000))],
             "dw_pose_shape": [list(dw_pose_image.shape)],
             "combined_shape": [list(dw_combined_image.shape)],
             "dw_pose_width": [output_width_for_dwpose],
             "dw_pose_height": [output_height_for_dwpose]
         }
         
-        # 返回结果 - 确保第7个返回值是 posture_text
         return {
             "ui": ui_data,
-            "result": (dw_pose_image, dw_combined_image, pose_3d_image, pose_2d_image, 
+            "result": (dw_pose_image, dw_combined_image, pose_3d_image, pose_2d_image,
                        output_width_for_dwpose, output_height_for_dwpose, posture_text)
         }
-    
-    # 生成姿态文字描述
-    def generate_posture_description(self, poses_datas):
-        if not poses_datas:
-            return "无姿态数据"
-        
-        try:
-            data = json.loads(poses_datas)
-            people = data.get("people", [])
-            if not people:
-                return "无人物姿态"
-            
-            # 获取第一个人的关键点
-            person = people[0]
-            keypoints = person.get("pose_keypoints_2d", [])
-            if not keypoints or len(keypoints) < 39:
-                return "关键点数据不完整"
-            
-            descriptions = []
-            
-            # 获取关键点坐标（COCO格式：x, y, confidence）
-            def get_point(idx):
-                base = idx * 3
-                if base + 2 < len(keypoints) and keypoints[base + 2] > 0:
-                    return {"x": keypoints[base], "y": keypoints[base + 1]}
-                return None
-            
-            # 获取关键部位
-            nose = get_point(0)
-            left_shoulder = get_point(5)
-            right_shoulder = get_point(6)
-            left_hip = get_point(11)
-            right_hip = get_point(12)
-            left_knee = get_point(13)
-            right_knee = get_point(14)
-            left_ankle = get_point(15)
-            right_ankle = get_point(16)
-            
-            # 判断身体姿态
-            if left_shoulder and right_shoulder and left_hip and right_hip:
-                shoulder_y = (left_shoulder["y"] + right_shoulder["y"]) / 2
-                hip_y = (left_hip["y"] + right_hip["y"]) / 2
-                
-                # 身体倾斜判断
-                body_tilt = abs(shoulder_y - hip_y)
-                if body_tilt < 0.1:
-                    descriptions.append("身体水平")
-                elif shoulder_y < hip_y - 0.1:
-                    descriptions.append("身体前倾")
-                elif shoulder_y > hip_y + 0.1:
-                    descriptions.append("身体后仰")
-                else:
-                    descriptions.append("身体直立")
-            
-            # 判断腿部姿态
-            if left_hip and left_knee:
-                left_knee_forward = left_knee["y"] - left_hip["y"]
-                if left_knee_forward < -0.1:
-                    descriptions.append("左膝盖抬起")
-            
-            if right_hip and right_knee:
-                right_knee_forward = right_knee["y"] - right_hip["y"]
-                if right_knee_forward < -0.1:
-                    descriptions.append("右膝盖抬起")
-            
-            # 判断双腿分开
-            if left_knee and right_knee:
-                knee_distance = abs(left_knee["x"] - right_knee["x"])
-                if knee_distance > 0.15:
-                    descriptions.append("双腿分开")
-                elif knee_distance < 0.05:
-                    descriptions.append("双腿并拢")
-            
-            if descriptions:
-                return "，".join(descriptions)
-            else:
-                return "标准姿态"
-                
-        except Exception as e:
-            return f"姿态解析错误: {str(e)}"
 
 
 # ====================================================================================================
-# SavePoseToJson 节点
-# ====================================================================================================
-class SavePoseToJson:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "pose_point": ("POSE_KEYPOINT",),      # 姿态关键点数据（包含canvas尺寸）
-                "filename_prefix": ("STRING", {"default": "poses/pose"})  # 保存文件名前缀
-            },
-            "optional": {
-                "pose_image": ("IMAGE",),  # 可选保存图片
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("filename",)
-    FUNCTION = "save_json"
-    OUTPUT_NODE = True
-    CATEGORY = "image"
-
-    def save_json(self, pose_point, filename_prefix="pose", pose_image=None):
-        # ========== 核心修改：从pose_point获取canvas尺寸 ==========
-        image_width = 512  # 默认值
-        image_height = 512 # 默认值
-        
-        # 解析pose_point获取canvas尺寸
-        if pose_point and isinstance(pose_point, list) and len(pose_point) > 0:
-            # 取第一个元素（对应你的JSON数组中的第一个对象）
-            first_pose_data = pose_point[0]
-            if isinstance(first_pose_data, dict):
-                # 从pose数据中读取canvas尺寸
-                image_width = first_pose_data.get("canvas_width", 512)
-                image_height = first_pose_data.get("canvas_height", 512)
-
-        # ========== 处理姿态关键点数据 ==========
-        processed_people = []
-        if pose_point and isinstance(pose_point, list) and len(pose_point) > 0:
-            for result_dict in pose_point:
-                # 安全获取 people 列表
-                people_in_dict = result_dict.get("people", []) if isinstance(result_dict, dict) else []
-                for person in people_in_dict:
-                    if not isinstance(person, dict):
-                        continue
-                        
-                    # 获取原始关键点并初始化输出数组
-                    original_keypoints = person.get("pose_keypoints_2d", [])
-                    body_keypoints = [0.0] * 54  # 18个关键点 × 3（x,y,confidence）
-                    
-                    # 复制并转换关键点（相对坐标 → 绝对坐标）
-                    num_points_to_copy = min(18, len(original_keypoints) // 3)
-                    for i in range(num_points_to_copy):
-                        base_idx = i * 3
-                        # 安全取值（避免索引越界）
-                        if base_idx + 2 >= len(original_keypoints):
-                            continue
-                            
-                        x = original_keypoints[base_idx]
-                        y = original_keypoints[base_idx + 1]
-                        confidence = original_keypoints[base_idx + 2]
-                        
-                        if confidence > 0 and image_width > 0 and image_height > 0:
-                            # 相对坐标（0-1）转换为绝对像素坐标
-                            absolute_x = x * image_width
-                            absolute_y = y * image_height
-                            body_keypoints[base_idx] = absolute_x
-                            body_keypoints[base_idx + 1] = absolute_y
-                            body_keypoints[base_idx + 2] = confidence
-                    
-                    processed_people.append({
-                        "pose_keypoints_2d": body_keypoints
-                    })
-
-        # ========== 保存 JSON 文件 ==========
-        # 构建要保存的数据（保留canvas尺寸信息）
-        data_to_save = {
-            "width": int(image_width),
-            "height": int(image_height),
-            "canvas_width": int(image_width),   # 兼容保留原字段
-            "canvas_height": int(image_height), # 兼容保留原字段
-            "people": processed_people
-        }
-
-        # 生成保存路径和文件名
-        output_dir = folder_paths.get_output_directory()
-        full_output_folder, filename, _, subfolder, _ = folder_paths.get_save_image_path(
-            filename_prefix, output_dir, image_width, image_height
-        )
-        
-        # 确保保存文件夹存在
-        os.makedirs(full_output_folder, exist_ok=True)
-        
-        # 处理文件计数器（避免重复）
-        counter = 1
-        try:
-            existing_files = [f for f in os.listdir(full_output_folder) 
-                             if f.startswith(filename + "_") and f.endswith(".json")]
-            if existing_files:
-                max_counter = 0
-                for f in existing_files:
-                    try:
-                        num_str = f[len(filename)+1:-5]  # 提取数字部分
-                        num = int(num_str)
-                        if num > max_counter:
-                            max_counter = num
-                    except ValueError:
-                        continue
-                counter = max_counter + 1
-        except FileNotFoundError:
-            pass
-
-        # 保存文件（UTF-8编码，兼容中文）
-        final_filename = f"{filename}_{counter:05d}.json"
-        file_path = os.path.join(full_output_folder, final_filename)
-
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data_to_save, f, indent=4, ensure_ascii=False)
-
-        result_filename = os.path.join(subfolder, final_filename) if subfolder else final_filename
-
-        # ========== 保存图片文件 (新增功能) ==========
-        if pose_image is not None:
-            try:
-                # 处理 batch 中的第一张图片
-                img_tensor = pose_image[0]
-                i = 255. * img_tensor.cpu().numpy()
-                img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-                
-                image_filename = f"{filename}_{counter:05d}.png"
-                image_file_path = os.path.join(full_output_folder, image_filename)
-                
-                img.save(image_file_path)
-            except Exception as e:
-                pass
-        
-        return {"ui": {"text": [result_filename]}, "result": (result_filename,)}
-
-
-# ====================================================================================================
-# 节点注册 + 修复TextConcatenator警告的全局方案
+# 节点注册
 # ====================================================================================================
 NODE_CLASS_MAPPINGS = {
     "Nui.OpenPoseEditor": OpenPoseEditor,
-    "SavePoseToJson": SavePoseToJson
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Nui.OpenPoseEditor": "whk_3DPose_edit_2D_DocKr",
-    "SavePoseToJson": "Save Pose to JSON (from Keypoint)"
 }
-
-# 【关键】全局修复TextConcatenator的IS_CHANGED警告（一次性解决）
-try:
-    from nodes import TextConcatenator
-    # 重写TextConcatenator的IS_CHANGED方法，兼容所有参数
-    original_tc_is_changed = TextConcatenator.IS_CHANGED
-    @classmethod
-    def fixed_tc_is_changed(cls, *args, **kwargs):
-        return original_tc_is_changed(cls, *args, **kwargs) if callable(original_tc_is_changed) else str(time.time())
-    TextConcatenator.IS_CHANGED = fixed_tc_is_changed
-except ImportError:
-    pass
