@@ -1,6 +1,4 @@
-# ComfyUI-3D-OpenPose-EditorUD
-
-20260514更新了numpy支持版本,不用锁定numpy<2
+# ComfyUI-3D-OpenPose-Editor2026
 
 
 这是一个为 ComfyUI 设计的3D OpenPose 编辑器节点。支持实时匹配画布大小、一键匹配上游图片尺寸、3D姿态调整、自动提示词匹配等功能。
